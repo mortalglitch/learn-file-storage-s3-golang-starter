@@ -1,20 +1,32 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
+
+type VideoInformation struct {
+	Data []StreamInfo `json:"streams"`
+}
+
+type StreamInfo struct {
+	AspectRatio string `json:"display_aspect_ratio"`
+}
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	videoIDString := r.PathValue("videoID")
@@ -68,7 +80,8 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	videoFile, err := os.CreateTemp("", "tubely-upload.mp4")
+	//videoFile, err := os.CreateTemp("", "tubely-upload.mp4")
+	videoFile, err := os.CreateTemp("/tmp/", "tubely-upload.mp4")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to create file storage", err)
 		return
@@ -83,14 +96,27 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	videoFile.Seek(0, io.SeekStart)
 
+	aspect, err := getVideoAspectRatio(videoFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to fetch aspect ratio", err)
+		return
+	}
+
 	fileType := strings.TrimPrefix(mediaType, "video/")
 
 	// Generate new filename for each image
 	key := make([]byte, 32)
 	rand.Read(key)
 	// base64.URLEncoding.EncodeToString(key)
-
-	videoFilename := fmt.Sprintf("%s.%s", base64.URLEncoding.EncodeToString(key), fileType)
+	var aspectString string
+	if aspect == "16:9" {
+		aspectString = "landscape"
+	} else if aspect == "9:16" {
+		aspectString = "portrait"
+	} else {
+		aspectString = "other"
+	}
+	videoFilename := fmt.Sprintf("%s/%s.%s", aspectString, base64.URLEncoding.EncodeToString(key), fileType)
 
 	awsObject := s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
@@ -115,4 +141,32 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, videoData)
+}
+
+func getVideoAspectRatio(filepath string) (string, error) {
+	ffProbe := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filepath)
+	var ffProbeOut bytes.Buffer
+	ffProbe.Stdout = &ffProbeOut
+
+	err := ffProbe.Run()
+	if err != nil {
+		log.Println(err)
+		return "", fmt.Errorf("")
+	}
+
+	decoder := json.NewDecoder(&ffProbeOut)
+	results := VideoInformation{}
+	videoSuccess := decoder.Decode(&results)
+	if videoSuccess != nil {
+		return "", videoSuccess
+	}
+	if len(results.Data) < 1 {
+		return "", fmt.Errorf("Video data set empty")
+	}
+
+	if results.Data[0].AspectRatio != "16:9" && results.Data[0].AspectRatio != "9:16" {
+		return "other", nil
+	}
+
+	return results.Data[0].AspectRatio, nil
 }
