@@ -14,9 +14,11 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
+	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/database"
 	"github.com/google/uuid"
 )
 
@@ -145,16 +147,61 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	newURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, videoFilename)
+	//newURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, videoFilename)
+	newURL := fmt.Sprintf("%s,%s", cfg.s3Bucket, videoFilename)
 
 	videoData.VideoURL = &newURL
 
 	videoUpdate := cfg.db.UpdateVideo(videoData)
 	if videoUpdate != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to update video url", videoUpdate)
+		return
+	}
+
+	videoData, err = cfg.dbVideoToSignedVideo(videoData)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to build presigned URL in subprocess", err)
+		return
 	}
 
 	respondWithJSON(w, http.StatusOK, videoData)
+}
+
+func generatePresignedURL(s3Client *s3.Client, bucket, key string, expireTime time.Duration) (string, error) {
+
+	psClient := s3.NewPresignClient(s3Client)
+
+	params := s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	}
+	expireFunc := s3.WithPresignExpires(expireTime)
+	psRequest, err := psClient.PresignGetObject(context.Background(), &params, expireFunc)
+	if err != nil {
+		log.Println("Error presigning request")
+		return "", err
+	}
+	return psRequest.URL, nil
+}
+
+func (cfg *apiConfig) dbVideoToSignedVideo(video database.Video) (database.Video, error) {
+	if *video.VideoURL != "" {
+		log.Println(*video.VideoURL)
+		currentURLString := video.VideoURL
+		currentURLData := strings.Split(*currentURLString, ",")
+		if len(currentURLData) > 1 {
+			bucket := currentURLData[0]
+			key := currentURLData[1]
+			newURLString, err := generatePresignedURL(&cfg.s3client, bucket, key, time.Duration(10*time.Minute))
+			if err != nil {
+				log.Println("Error gettings presigned URL")
+				return video, err
+			}
+			video.VideoURL = &newURLString
+			return video, nil
+		}
+	}
+	return video, nil
 }
 
 func getVideoAspectRatio(filepath string) (string, error) {
